@@ -12,9 +12,14 @@ baseUrl is now a resolution root of last resort: tried only after every declared
 alias fails to match, so existing `paths` precedence (#1269, #927, #1531) is
 untouched.
 """
+import json
 from pathlib import Path
 
 from graphify.extract import _make_id, extract
+from graphify.extractors.resolution import (
+    _load_tsconfig_aliases,
+    _load_tsconfig_base_url,
+)
 
 
 def _write(path: Path, text: str) -> Path:
@@ -275,6 +280,32 @@ def test_tsconfig_jsonc_parent_and_null_child_options_are_safe(tmp_path):
     targets = _targets(extract([importer], cache_root=tmp_path))
 
     assert _cid(tmp_path, target) in targets
+
+
+def test_absolute_tsconfig_extends_cannot_read_external_config(tmp_path):
+    """Absolute parents must not import baseUrl or aliases from outside the project."""
+    workspace = tmp_path / "workspace"
+    external = tmp_path / "external"
+    external_config = _write(
+        external / "base.json",
+        json.dumps(
+            {
+                "compilerOptions": {
+                    "baseUrl": "./src",
+                    "paths": {"@external/*": ["*"]},
+                }
+            }
+        ),
+    )
+    _write(workspace / "tsconfig.json", json.dumps({"extends": str(external_config)}))
+    importer = _write(
+        workspace / "packs" / "dashboard.js",
+        "import Widget from 'mods/Widget.js';\nexport default Widget;\n",
+    )
+    _write(external / "src" / "mods" / "Widget.js", "export default 1;\n")
+
+    assert _load_tsconfig_base_url(importer.parent) is None
+    assert _load_tsconfig_aliases(importer.parent) == {}
 
 
 # --- config edits must survive the per-process caches (#2917) ---------------
