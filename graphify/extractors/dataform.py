@@ -137,6 +137,7 @@ def _mask_string_contents(text: str) -> str:
 def _parse_config(body: str) -> dict[str, Any]:
     config: dict[str, Any] = {}
     key_source = _mask_string_contents(_mask_comments(body))
+    comment_masked = _mask_comments(body)
     matches = list(_CONFIG_KEY_RE.finditer(key_source))
     for index, match in enumerate(matches):
         key = match.group("key")
@@ -174,9 +175,9 @@ def _parse_config(body: str) -> dict[str, Any]:
             value = _literal_string(body[start:end])
         else:
             end = start
-            while end < limit and body[end] not in ",\r\n":
+            while end < limit and comment_masked[end] not in ",\r\n":
                 end += 1
-            value = body[start:end].strip()
+            value = comment_masked[start:end].strip()
         if isinstance(value, str) and value:
             config[key] = [value] if key == "dependencies" else value
     return config
@@ -260,7 +261,11 @@ def _call_target(kind: str, args: str, model_name: str) -> str | None:
         return values[0].strip() or None
     if len(values) == 2:
         first, second = (value.strip() for value in values)
-        return f"{first}.{second}" if first and second else None
+        # The graph's Dataform model IDs are keyed by model name (the file stem),
+        # while the first ref argument selects its schema. Keep the target ID
+        # aligned with that model identity so schema-qualified refs resolve to
+        # models whose config declares the selected schema.
+        return second if first and second else None
     return None
 
 

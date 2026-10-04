@@ -22,7 +22,10 @@ def test_extracts_model_config_and_literal_refs(tmp_path):
     events = tmp_path / "stg_events.sqlx"
     events.write_text('config { type: "table" }\nSELECT 1;\n', encoding="utf-8")
     users = tmp_path / "users.sqlx"
-    users.write_text('config { type: "table" }\nSELECT 1;\n', encoding="utf-8")
+    users.write_text(
+        'config { type: "table", schema: "analytics" }\nSELECT 1;\n',
+        encoding="utf-8",
+    )
 
     model = tmp_path / "daily_events.sqlx"
     model.write_text(FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
@@ -44,7 +47,7 @@ def test_extracts_model_config_and_literal_refs(tmp_path):
     }
     assert dependencies == {
         ("dataform_stg_events", "dataform_config"),
-        ("dataform_analytics_users", "dataform_ref"),
+        ("dataform_users", "dataform_ref"),
     }
     assert not any(
         edge["target"] == "dataform_daily_events"
@@ -95,6 +98,22 @@ def test_config_array_delimiter_ignores_comments_and_stays_within_field(tmp_path
     assert result["nodes"][0]["dataform_config"] == {
         "tags": ["daily /* ] */", "reporting"],
         "dependencies": ["upstream"],
+    }
+
+
+def test_unquoted_config_value_ignores_trailing_comment(tmp_path):
+    model = tmp_path / "trailing_comment.sqlx"
+    model.write_text(
+        "config { schema: analytics /* trailing comment */, type: table }\n"
+        "SELECT 1;\n",
+        encoding="utf-8",
+    )
+
+    result = extract([model])
+
+    assert result["nodes"][0]["dataform_config"] == {
+        "schema": "analytics",
+        "type": "table",
     }
 
 
@@ -168,6 +187,6 @@ def test_multiline_ref_call_is_extracted(tmp_path):
     result = extract_dataform(model)
 
     assert [edge["target"] for edge in result["edges"]] == [
-        "dataform_analytics_upstream"
+        "dataform_upstream"
     ]
     assert result["edges"][0]["source_location"] == "L2"
