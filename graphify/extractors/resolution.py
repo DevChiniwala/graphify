@@ -93,9 +93,11 @@ def _strip_jsonc(text: str) -> str:
     return stripped
 
 def _read_tsconfig_aliases(tsconfig: Path, base_dir: Path, seen: set) -> dict[str, list[str]]:
-    """Recursively read path aliases from a tsconfig, following extends chains.
+    """Recursively read path aliases from a tsconfig, following extends chains
+    and `references` project links (the solution-file layout, #3745).
 
-    Child config paths override parent. Circular extends are detected via seen set.
+    Child config paths override parent. Circular extends/references are detected
+    via seen set.
     npm package configs (e.g. @tsconfig/svelte) are skipped since they're not on disk.
     Handles JSONC (comments + trailing commas) which is the default tsconfig format
     for SvelteKit, NestJS, Vite, T3, Astro, etc. (#700).
@@ -143,6 +145,33 @@ def _read_tsconfig_aliases(tsconfig: Path, base_dir: Path, seen: set) -> dict[st
             extended_path = extended_path.with_suffix(".json")
         if extended_path.exists():
             aliases.update(_read_tsconfig_aliases(extended_path, extended_path.parent, seen))
+
+    # `references` — the solution-file / `tsc -b` layout (Vite, React, many
+    # monorepos): the root tsconfig.json is a solution file (`"files": []` with
+    # `references: [{path: ...}]`) that carries no `paths` of its own; every
+    # compilerOptions.paths block lives in a referenced project config
+    # (tsconfig.app.json, tsconfig.node.json, …). `extends` is not involved, so
+    # without following references the walk-up finds the solution file, sees no
+    # paths and no extends, and stops — every alias import then silently gets no
+    # edge (#3745). Merge each referenced config like an additional parent (the
+    # referencing config's own `paths` below still override), guarded by the same
+    # `seen` set that already protects extends against cycles. A reference `path`
+    # may name a directory (resolved to its tsconfig.json, per `tsc -b`) or a file.
+    references = data.get("references")
+    if isinstance(references, list):
+        for ref in references:
+            if not isinstance(ref, dict):
+                continue
+            ref_path = ref.get("path")
+            if not isinstance(ref_path, str) or not ref_path:
+                continue
+            referenced = _resolve_cached(base_dir / ref_path)
+            if referenced.is_dir():
+                referenced = referenced / "tsconfig.json"
+            elif not referenced.suffix:
+                referenced = referenced.with_suffix(".json")
+            if referenced.exists():
+                aliases.update(_read_tsconfig_aliases(referenced, referenced.parent, seen))
 
     # tsconfig `paths` are resolved relative to `baseUrl` (itself relative to
     # the tsconfig's directory), not the tsconfig directory directly. Honoring
@@ -212,7 +241,9 @@ def _find_js_config(start_dir: Path) -> "tuple[Path, Path] | None":
 def _load_tsconfig_aliases(start_dir: Path) -> dict[str, list[str]]:
     """Walk up from start_dir to find tsconfig/jsconfig.json and return compilerOptions.paths aliases.
 
-    Follows extends chains so SvelteKit/Nuxt/NestJS inherited aliases are included.
+    Follows extends chains so SvelteKit/Nuxt/NestJS inherited aliases are included,
+    and `references` so a Vite/`tsc -b` solution-file root reaches the per-project
+    `paths` (#3745).
     Returns a dict mapping alias patterns to ordered resolved target patterns;
     wildcard tokens remain intact for substitution during resolution (#927).
     Result is cached by config path string. The cache has no mtime/content
@@ -591,6 +622,16 @@ def _package_entry_candidates(
     candidates.append(package_dir / "index")
     return candidates
 
+_BUILD_OUTPUT_DIRS = frozenset({"dist", "build", "target", "out", "dist-protected"})
+
+def _is_build_output_path(path: Path, package_dir: Path) -> bool:
+    """True if path points into a known build-output directory within package_dir."""
+    try:
+        rel = _resolve_cached(path).relative_to(_resolve_cached(package_dir))
+        return bool(rel.parts and rel.parts[0] in _BUILD_OUTPUT_DIRS)
+    except ValueError:
+        return False
+
 def _resolve_workspace_import(raw: str, start_dir: Path) -> Path | None:
     packages = _load_workspace_packages(start_dir)
     platform = _importer_platform(start_dir)
@@ -601,10 +642,17 @@ def _resolve_workspace_import(raw: str, start_dir: Path) -> Path | None:
             subpath = raw[len(package_name) + 1:]
         else:
             continue
+        build_fallback: Path | None = None
         for candidate in _package_entry_candidates(package_dir, subpath, platform):
             resolved = _resolve_js_import_path(candidate)
             if resolved.is_file():
-                return resolved
+                if _is_build_output_path(resolved, package_dir):
+                    if build_fallback is None:
+                        build_fallback = resolved
+                else:
+                    return resolved
+        if build_fallback is not None:
+            return build_fallback
     return None
 
 def _find_js_project_anchor(start_dir: Path) -> Path:
@@ -2298,6 +2346,56 @@ def _probe_python_module_candidate(candidate: Path) -> Path | None:
     return None
 
 
+# Cache: scan root (resolved str) → dotted namespace prefix or ""
+_SCAN_ROOT_NAMESPACE_CACHE: dict[str, str] = {}
+
+def _infer_scan_root_namespace(root: Path) -> str:
+    """Infer the dotted Python package namespace of the scan root.
+
+    Walks upward from `root` collecting ancestor directory names as long as each
+    ancestor contains an ``__init__.py``. Stops at the first ancestor without one
+    (the true package boundary). Returns the dotted namespace prefix that should
+    be stripped from absolute imports that reference the scan root's own modules.
+
+    Example: root = /repo/Company/Apps/Jobs/Team, and Company/, Apps/, Jobs/
+    each contain __init__.py → returns "Company.Apps.Jobs.Team".
+
+    Returns "" when root is already at or above the package boundary.
+
+    Cached per resolved root path string; cleared when resolution caches are
+    cleared (extract() resets caches per run).
+    """
+    key = str(_resolve_cached(root))
+    cached_ns = _SCAN_ROOT_NAMESPACE_CACHE.get(key)
+    if cached_ns is not None:
+        return cached_ns
+
+    parts: list[str] = []
+    current = _resolve_cached(root)
+    # Include root's own name in the namespace
+    parts.append(current.name)
+    parent = current.parent
+
+    while parent != current:  # stop at filesystem root
+        if not (parent / "__init__.py").is_file():
+            break
+        parts.append(parent.name)
+        current = parent
+        parent = parent.parent
+
+    if len(parts) <= 1:
+        # Root itself is the package boundary (or root IS the top-level package).
+        # Only return a namespace if the root's PARENT has __init__.py (meaning
+        # root is nested inside a package chain).
+        _SCAN_ROOT_NAMESPACE_CACHE[key] = ""
+        return ""
+
+    parts.reverse()
+    namespace = ".".join(parts)
+    _SCAN_ROOT_NAMESPACE_CACHE[key] = namespace
+    return namespace
+
+
 def _resolve_python_module_path(module_name: str, current_path: Path, root: Path, level: int) -> Path | None:
     if level > 0:
         base = current_path.parent
@@ -2316,6 +2414,25 @@ def _resolve_python_module_path(module_name: str, current_path: Path, root: Path
     hit = _probe_python_module_candidate(root / rel)
     if hit is not None:
         return hit
+
+    # NEW: Scan-root namespace projection (#3843).
+    # When the scan root is nested inside a package hierarchy
+    # (e.g., root = Team/, namespace = Company.Apps.Jobs.Team),
+    # an import like "Company.Apps.Jobs.Team.lib" fails the probe above
+    # because root/Company/Apps/Jobs/Team/lib doesn't exist. Strip the
+    # namespace prefix and re-probe relative to root.
+    ns = _infer_scan_root_namespace(root)
+    if ns and (module_name == ns or module_name.startswith(ns + ".")):
+        stripped = module_name[len(ns) + 1:] if module_name != ns else ""
+        if stripped:
+            hit = _probe_python_module_candidate(root / stripped.replace(".", "/"))
+            if hit is not None:
+                return hit
+        else:
+            hit = _probe_python_module_candidate(root)
+            if hit is not None:
+                return hit
+
     for anc in current_path.parents:
         try:
             anc.relative_to(root)
@@ -2367,6 +2484,19 @@ def _resolve_python_namespace_dir(module_name: str, current_path: Path, root: Pa
     hit = _namespace(root / rel)
     if hit is not None:
         return hit
+
+    # NEW: Scan-root namespace projection (#3843).
+    ns = _infer_scan_root_namespace(root)
+    if ns and (module_name == ns or module_name.startswith(ns + ".")):
+        stripped = module_name[len(ns) + 1:] if module_name != ns else ""
+        if stripped:
+            hit = _namespace(root / stripped.replace(".", "/"))
+            if hit is not None:
+                return hit
+        else:
+            hit = _namespace(root)
+            if hit is not None:
+                return hit
     for anc in current_path.parents:
         try:
             anc.relative_to(root)
