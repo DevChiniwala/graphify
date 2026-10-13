@@ -308,6 +308,20 @@ def test_absolute_tsconfig_extends_cannot_read_external_config(tmp_path):
     assert _load_tsconfig_aliases(importer.parent) == {}
 
 
+def test_windows_absolute_tsconfig_extends_cannot_escape_project(tmp_path):
+    """Drive and UNC extends stay external even when tests run on POSIX."""
+    for index, extends in enumerate((r"C:\outside\base.json", r"\\server\share\base.json")):
+        workspace = tmp_path / f"workspace-{index}"
+        _write(workspace / "tsconfig.json", json.dumps({"extends": extends}))
+        importer = _write(
+            workspace / "packs" / "dashboard.js",
+            "import Widget from 'mods/Widget.js';\nexport default Widget;\n",
+        )
+
+        assert _load_tsconfig_base_url(importer.parent) is None
+        assert _load_tsconfig_aliases(importer.parent) == {}
+
+
 # --- config edits must survive the per-process caches (#2917) ---------------
 #
 # `_TSCONFIG_ALIAS_CACHE` and `_TSCONFIG_BASEURL_CACHE` are keyed on the config
