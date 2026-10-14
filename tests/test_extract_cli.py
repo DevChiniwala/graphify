@@ -628,6 +628,17 @@ def test_extract_force_flag_redispatches_and_stamps_manifest(monkeypatch, tmp_pa
     )
     assert calls[1]["paths"] == [str(corpus / "README.md")]
 
+    # The upstream force/cache path and the run-status finalizer must coexist:
+    # a warm-cache override still records the actual code and semantic dispatch.
+    status = json.loads(
+        (corpus / "graphify-out" / "last_run.json").read_text(encoding="utf-8")
+    )
+    assert status["ok"] is True
+    assert status["wrote_graph"] is True
+    assert status["files_dispatched"] == 2
+    assert status["chunks_total"] == 1
+    assert status["chunks_failed"] == 0
+
     # The forced run still wrote the semantic cache and stamped the manifest.
     # Entries nest under a p{prompt-fingerprint}/ subdir (#1939).
     assert any((corpus / "graphify-out" / "cache" / "semantic").glob("**/*.json"))

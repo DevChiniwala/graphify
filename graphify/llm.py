@@ -102,6 +102,26 @@ def _resolve_ollama_base_url(default: str) -> str:
     return host
 
 
+def _resolve_ollama_seed() -> int | None:
+    """Return the opt-in seed for built-in Ollama requests, if configured."""
+    raw = os.environ.get("GRAPHIFY_OLLAMA_SEED")
+    if raw is None or not raw.strip():
+        return None
+    value = raw.strip()
+    max_seed = "9223372036854775807"
+    normalized = value.lstrip("0") or "0"
+    if (
+        re.fullmatch(r"[0-9]+", value) is None
+        or len(normalized) > len(max_seed)
+        or (len(normalized) == len(max_seed) and normalized > max_seed)
+    ):
+        raise ValueError(
+            "GRAPHIFY_OLLAMA_SEED must be an ASCII integer in the range "
+            f"0..{max_seed}."
+        )
+    return int(normalized)
+
+
 BACKENDS: dict[str, dict] = {
     "claude": {
         # ANTHROPIC_BASE_URL points the backend at any Anthropic-compatible
@@ -1377,6 +1397,7 @@ def _call_openai_compat(
     extra_body: dict | None = None,
 ) -> dict:
     """Call any OpenAI-compatible API (Kimi, OpenAI, etc.) and return parsed JSON."""
+    ollama_seed = _resolve_ollama_seed() if backend == "ollama" else None
     try:
         from openai import OpenAI
     except ImportError as exc:
@@ -1413,6 +1434,8 @@ def _call_openai_compat(
         kwargs["temperature"] = temperature
     if reasoning_effort is not None:
         kwargs["reasoning_effort"] = reasoning_effort
+    if ollama_seed is not None:
+        kwargs["seed"] = ollama_seed
     # A custom provider in providers.json can pass its own extra_body (e.g.
     # `chat_template_kwargs.enable_thinking=false` for self-hosted Qwen3 served
     # by vLLM). When supplied, it wins over the moonshot default — the user has
@@ -1483,8 +1506,11 @@ def _call_openai_compat(
         raise ValueError("LLM returned empty or filtered response")
     raw_content = resp.choices[0].message.content
     result = _parse_llm_json(raw_content or "{}")
-    result["input_tokens"] = resp.usage.prompt_tokens if resp.usage else 0
-    result["output_tokens"] = resp.usage.completion_tokens if resp.usage else 0
+    # Some OpenAI-compatible gateways report null token counts (#4325) — coerce
+    # to 0 so the ollama low-token warning and the per-chunk merge below don't
+    # crash comparing/adding None.
+    result["input_tokens"] = (resp.usage.prompt_tokens or 0) if resp.usage else 0
+    result["output_tokens"] = (resp.usage.completion_tokens or 0) if resp.usage else 0
     result["model"] = model
     # `finish_reason == "length"` means the model hit max_completion_tokens
     # mid-generation. The JSON we got back is truncated; callers should
@@ -1531,8 +1557,8 @@ def _call_claude(api_key: str, model: str, user_message: str, max_tokens: int = 
     )
     raw_content = _anthropic_response_text(resp.content)
     result = _parse_llm_json(raw_content or "{}")
-    result["input_tokens"] = resp.usage.input_tokens if resp.usage else 0
-    result["output_tokens"] = resp.usage.output_tokens if resp.usage else 0
+    result["input_tokens"] = (resp.usage.input_tokens or 0) if resp.usage else 0
+    result["output_tokens"] = (resp.usage.output_tokens or 0) if resp.usage else 0
     result["model"] = model
     # Normalise Anthropic's `stop_reason` to the OpenAI-compat `finish_reason`
     # vocabulary so the adaptive-retry layer doesn't have to know which
@@ -1885,8 +1911,8 @@ def _call_azure(
         raise ValueError("Azure OpenAI returned empty or filtered response")
     raw_content = resp.choices[0].message.content
     result = _parse_llm_json(raw_content or "{}")
-    result["input_tokens"] = resp.usage.prompt_tokens if resp.usage else 0
-    result["output_tokens"] = resp.usage.completion_tokens if resp.usage else 0
+    result["input_tokens"] = (resp.usage.prompt_tokens or 0) if resp.usage else 0
+    result["output_tokens"] = (resp.usage.completion_tokens or 0) if resp.usage else 0
     result["model"] = model
     result["finish_reason"] = resp.choices[0].finish_reason
     _mark_hollow(result, raw_content, "azure")
@@ -1936,8 +1962,8 @@ def _call_bedrock(model: str, user_message: str, max_tokens: int = 8192, *, deep
     text = _bedrock_response_text(resp, default="{}")
     result = _parse_llm_json(text)
     usage = resp.get("usage", {})
-    result["input_tokens"] = usage.get("inputTokens", 0)
-    result["output_tokens"] = usage.get("outputTokens", 0)
+    result["input_tokens"] = usage.get("inputTokens", 0) or 0
+    result["output_tokens"] = usage.get("outputTokens", 0) or 0
     result["model"] = model
     result["finish_reason"] = "length" if resp.get("stopReason") == "max_tokens" else "stop"
     _mark_hollow(result, text, "bedrock")
@@ -2822,6 +2848,7 @@ def extract_corpus_parallel(
     dropped_ids: set = set()
     dropped_files: set[str] = set()
     kept_nodes: list[dict] = []
+    kept_ids: set = set()
     for n in merged.get("nodes", []):
         if _out_of_scope(n):
             if n.get("id") is not None:
@@ -2829,18 +2856,27 @@ def extract_corpus_parallel(
             dropped_files.add(str(n.get("source_file")))
             continue
         kept_nodes.append(n)
+        if n.get("id") is not None:
+            kept_ids.add(n.get("id"))
     dropped_node_count = len(merged.get("nodes", [])) - len(kept_nodes)
     merged["out_of_scope_dropped"] = dropped_node_count
     if dropped_node_count:
         merged["nodes"] = kept_nodes
-        # Keep the graph consistent: an edge or hyperedge referencing a
-        # dropped node's id (or itself attributed to an undispatched real
-        # file) must not survive its endpoint.
+        # Keep the graph consistent: drop an edge that references a dropped
+        # node's id. An edge attributed to an undispatched file is kept when
+        # both endpoints are kept nodes (#2276). Hyperedges stay on the
+        # out-of-scope predicate.
         merged["edges"] = [
             e for e in merged.get("edges", [])
-            if not _out_of_scope(e)
-            and e.get("source") not in dropped_ids
+            if e.get("source") not in dropped_ids
             and e.get("target") not in dropped_ids
+            and (
+                not _out_of_scope(e)
+                or (
+                    e.get("source") in kept_ids
+                    and e.get("target") in kept_ids
+                )
+            )
         ]
         merged["hyperedges"] = [
             h for h in merged.get("hyperedges", [])
@@ -2868,6 +2904,7 @@ def extract_corpus_parallel(
         if p.resolve() not in {c.resolve() for c in covered}
     )
     merged["uncovered_files"] = [str(p) for p in uncovered]
+    _stamp_semantic_origin(merged)
     if uncovered:
         shown = ", ".join(p.name for p in uncovered[:5])
         more = f" (+{len(uncovered) - 5} more)" if len(uncovered) > 5 else ""
@@ -2878,6 +2915,24 @@ def extract_corpus_parallel(
             file=sys.stderr,
         )
     return merged
+
+
+def _stamp_semantic_origin(result: dict) -> dict:
+    """Mark every node and edge of a semantic extraction ``_origin: "semantic"``.
+
+    build._is_ast_tier reads ``_origin`` when present and otherwise guesses
+    from the shape of ``source_location``: ``L<line>`` means AST. A backend
+    or subagent that reports line numbers for a document's sections made
+    those nodes read as AST, and the next incremental rebuild deleted them
+    with the re-extracted code file they seemed to belong to (#2843).
+    extract() stamps its items ``ast``; this is the semantic counterpart.
+    Existing stamps are kept (``setdefault``); returns ``result``.
+    """
+    for key in ("nodes", "edges"):
+        for item in result.get(key, []) or []:
+            if isinstance(item, dict):
+                item.setdefault("_origin", "semantic")
+    return result
 
 
 def _merge_into(merged: dict, result: dict) -> None:
@@ -2923,6 +2978,7 @@ def _call_llm(
     """
     if backend not in BACKENDS:
         raise ValueError(f"Unknown backend {backend!r}")
+    ollama_seed = _resolve_ollama_seed() if backend == "ollama" else None
     cfg = BACKENDS[backend]
     key = _get_backend_api_key(backend)
     if not key and backend == "ollama":
@@ -2971,8 +3027,12 @@ def _call_llm(
         elif shutil.which("claude") is None:
             raise RuntimeError("Claude Code CLI not found on $PATH")
         cli_args = [claude_cmd, "-p", "--output-format", "json", "--no-session-persistence"]
-        if model is not None:
-            cli_args.extend(["--model", mdl])
+        cli_model = (
+            mdl if model is not None
+            else os.environ.get("GRAPHIFY_CLAUDE_CLI_MODEL", "").strip()
+        )
+        if cli_model:
+            cli_args.extend(["--model", cli_model])
         proc = subprocess.run(
             cli_args,
             input=prompt,
@@ -3075,6 +3135,8 @@ def _call_llm(
         kwargs["temperature"] = temperature
     if cfg.get("reasoning_effort"):
         kwargs["reasoning_effort"] = cfg["reasoning_effort"]
+    if ollama_seed is not None:
+        kwargs["seed"] = ollama_seed
     # Custom providers can override via providers.json `extra_body`; falls back
     # to the moonshot default to preserve existing behavior.
     if cfg.get("extra_body") is not None:
