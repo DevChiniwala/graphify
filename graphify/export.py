@@ -172,6 +172,20 @@ from graphify.exporters.base import COMMUNITY_COLORS  # noqa: E402,F401
 from graphify.exporters.html import to_html  # noqa: E402,F401
 
 
+# Increment when the persisted graph structure changes incompatibly for consumers.
+GRAPH_SCHEMA_VERSION = 1
+
+
+def _graphify_version() -> str | None:
+    """Return the installed graphify version for graph provenance."""
+    try:
+        from importlib.metadata import version
+
+        return version("graphifyy")
+    except Exception:
+        return None
+
+
 # Fallback scores for an edge that carries a confidence tier but no
 # confidence_score. The INFERRED default was 0.5, which references/extraction-spec.md
 # rules out in as many words — "never omit it, never use 0.5 as a default" — and
@@ -296,10 +310,14 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
                 # Empty/whitespace existing file (e.g. a freshly touched path):
                 # no nodes to lose, so any new graph is a growth — proceed.
                 existing_n = 0
+                existing_nodes = []
             else:
                 try:
                     existing_data = json.loads(raw)
-                    existing_n = len(existing_data.get("nodes", []))
+                    existing_nodes = existing_data.get("nodes", [])
+                    if not isinstance(existing_nodes, list):
+                        existing_nodes = []
+                    existing_n = len(existing_nodes)
                 except Exception as exc:
                     # Non-empty but unparseable existing graph (corrupt or a
                     # mid-write): we cannot verify the new graph is not a silent
@@ -316,6 +334,21 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
                     )
                     return False
             new_n = G.number_of_nodes()
+            from graphify.build import _lost_saved_semantic_nodes
+            new_node_list = [
+                {"id": node_id, **{key: value for key, value in attrs.items() if key != "id"}}
+                for node_id, attrs in G.nodes(data=True)
+            ]
+            missing = _lost_saved_semantic_nodes(existing_nodes, new_node_list, set())
+            if missing:
+                import sys as _sys
+                ids = ", ".join(str(node.get("id")) for node in missing)
+                print(
+                    "[graphify] WARNING: Refusing to overwrite — saved semantic "
+                    f"node(s) are missing from the new graph: {ids}.",
+                    file=_sys.stderr,
+                )
+                return False
             if new_n < existing_n:
                 import sys as _sys
                 print(
@@ -433,6 +466,11 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
     if isinstance(data.get("graph"), dict) and "hyperedges" in data["graph"]:
         data["graph"]["hyperedges"] = hyperedges
     data["hyperedges"] = hyperedges
+    graph_metadata = data.setdefault("graph", {})
+    graph_metadata["schema_version"] = GRAPH_SCHEMA_VERSION
+    graphify_version = _graphify_version()
+    if graphify_version is not None:
+        graph_metadata["graphify_version"] = graphify_version
     # Fallback provenance comes from the repo the graph is being written INTO
     # (output_path lives in <target>/graphify-out/), never the shell's cwd —
     # the same cwd-anchoring mistake #2316 fixed for `update`.
@@ -441,7 +479,7 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
         data["built_at_commit"] = commit
     from graphify.paths import write_json_atomic
     # Atomic write: a crash/ENOSPC mid-write must not truncate a good graph.json.
-    write_json_atomic(output_path, data, indent=2)
+    write_json_atomic(output_path, data, compact=True)
     return True
 
 
@@ -517,6 +555,7 @@ def to_cypher(G: nx.Graph, output_path: str) -> None:
         lines.append(f"MERGE (n:{ftype} {{id: '{node_id_esc}', label: '{label}'}});")
     lines.append("")
     for u, v, data in G.edges(data=True):
+        u, v = data.get("_src", u), data.get("_tgt", v)
         rel = _cypher_label(
             (data.get("relation", "RELATES_TO") or "RELATES_TO").upper(),
             "RELATES_TO",
@@ -1223,6 +1262,7 @@ def to_canvas(
     # Generate edges - only between nodes both in canvas, cap at 200 highest-weight
     all_edges_weighted: list[tuple[float, str, str, str]] = []
     for u, v, edata in G.edges(data=True):
+        u, v = edata.get("_src", u), edata.get("_tgt", v)
         if u in all_canvas_nodes and v in all_canvas_nodes:
             weight = edata.get("weight", 1.0)
             relation = edata.get("relation", "")
@@ -1369,7 +1409,8 @@ def to_svg(
     nx.draw_networkx_nodes(G, pos, ax=ax, node_color=node_colors,
                            node_size=node_sizes, alpha=0.9)
     nx.draw_networkx_labels(G, pos, ax=ax,
-                            labels={n: G.nodes[n].get("label", n) for n in G.nodes()},
+                            labels={n: _strip_xml_illegal(str(G.nodes[n].get("label", n)))
+                                    for n in G.nodes()},
                             font_size=7, font_color="white")
 
     # Legend
@@ -1377,7 +1418,7 @@ def to_svg(
         patches = [
             mpatches.Patch(
                 color=COMMUNITY_COLORS[cid % len(COMMUNITY_COLORS)],
-                label=f"{label} ({len(communities.get(cid, []))})",
+                label=_strip_xml_illegal(f"{label} ({len(communities.get(cid, []))})"),
             )
             for cid, label in sorted(community_labels.items())
         ]
