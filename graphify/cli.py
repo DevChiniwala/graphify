@@ -624,6 +624,7 @@ def _zero_node_stamped_code_sources(
     graph_path: Path,
     scan_root: Path,
     unchanged_code: list[str],
+    manifest_path: Path | None = None,
 ) -> list[str]:
     """Manifest-stamped code files with a registered extractor but ZERO nodes
     in the existing graph.json (#2543 heal).
@@ -637,6 +638,12 @@ def _zero_node_stamped_code_sources(
     property: if it fails again this run it is now left unstamped, and if it
     succeeds its nodes enter graph.json so the next scan stops re-queuing it.
 
+    A file the extractor declines by design (data JSON, #2879) is a legitimate
+    stamped-but-zero-node row, not a poisoned one. Its manifest row carries
+    ``ast_empty: true``; skip those here or the heal re-queues them on every
+    incremental forever. A pre-#2879 manifest lacks the marker, so such a file
+    is re-queued once more, then stamped with it and left alone thereafter.
+
     Membership mirrors the ``source_file`` spellings extracts store (#1897/
     #1941: scan-root-relative, forward slash; absolute for out-of-root) and
     compares NFC-normalized (#2210/#2221).
@@ -644,6 +651,12 @@ def _zero_node_stamped_code_sources(
     if not unchanged_code:
         return []
     from graphify.paths import nfc
+    ast_empty: set[str] = set()
+    if manifest_path is not None:
+        from graphify.detect import load_manifest
+        for _k, _v in load_manifest(str(manifest_path), root=scan_root).items():
+            if isinstance(_v, dict) and _v.get("ast_empty"):
+                ast_empty.add(nfc(_k))
     try:
         data = json.loads(graph_path.read_text(encoding="utf-8"))
     except Exception:
@@ -698,6 +711,8 @@ def _zero_node_stamped_code_sources(
             pass
         if spellings & present:
             continue  # the graph has this file: stamp is honest
+        if spellings & ast_empty:
+            continue  # declined by design (#2879): zero nodes is intended
         healed.append(f)
     return healed
 
@@ -1532,7 +1547,7 @@ def dispatch_command(cmd: str) -> None:
         if len(sys.argv) < 3:
             print("Usage: graphify query \"<question>\" [--dfs] [--context C] [--seed X] [--budget N] [--graph path]", file=sys.stderr)
             sys.exit(1)
-        from graphify.serve import _QUERY_NO_MATCH, _query_graph_text
+        from graphify.serve import _QUERY_NO_MATCH, _is_ambiguity_refusal, _query_graph_text
         from graphify.security import sanitize_label
         from networkx.readwrite import json_graph
         from graphify import querylog
@@ -1664,7 +1679,9 @@ def dispatch_command(cmd: str) -> None:
         )
         _touch_query_stamp(gp)
         print(_result)
-        if _result == _QUERY_NO_MATCH:
+        if _is_ambiguity_refusal(_result):
+            sys.exit(EXIT_AMBIGUOUS)
+        if _result == _QUERY_NO_MATCH or _result.startswith("No unique node match for --seed:"):
             sys.exit(EXIT_NOT_FOUND)
     elif cmd == "affected":
         if len(sys.argv) < 3:
@@ -2523,12 +2540,19 @@ def dispatch_command(cmd: str) -> None:
             # been re-scoped/re-clustered since labeling, in which case a cid now
             # covers a DIFFERENT community and its old (LLM) name is wrong (#label-stale).
             # Validate each community against the membership signature saved beside the
-            # labels; any community that changed (or has no saved label) is renamed by
-            # its current hub — deterministic and correct-by-construction — and the user
+            # labels; a community whose overlap is not a strict majority of both
+            # the saved members and the current members (or that has no saved
+            # label) is renamed by its current hub — deterministic and
+            # correct-by-construction — and the user
             # is told to `graphify label` for fresh LLM names. Unchanged communities keep
             # their saved label. When no signature sidecar exists (labels predate this),
-            # fall back to hub-filling only the communities missing a label.
-            from graphify.cluster import community_member_sigs, label_communities_by_hub
+            # an equal community count still hub-fills only communities missing a
+            # label; a changed count keeps a label only on majority overlap.
+            from graphify.cluster import (
+                community_member_sigs,
+                label_communities_by_hub,
+                label_still_applies,
+            )
             sig_path = labels_path.parent / (labels_path.name + ".sig")
             saved_sigs: dict[int, str] = {}
             if sig_path.exists():
@@ -2555,14 +2579,29 @@ def dispatch_command(cmd: str) -> None:
                     and existing_labels[cid] != f"Community {cid}"
                 )
                 if saved_sigs:
-                    # Precise: the membership signature tells us if this exact
-                    # community changed since it was labeled.
-                    fresh = have_label and saved_sigs.get(cid) == cur_sigs.get(cid)
+                    # Equal signature, or a strict majority of both the saved
+                    # members and the current members (#2298).
+                    fresh = have_label and label_still_applies(
+                        cid,
+                        communities[cid],
+                        previous_node_community,
+                        saved_sigs.get(cid),
+                        cur_sigs.get(cid),
+                    )
+                elif count_mismatch:
+                    # No signature sidecar. A changed count used to drop every
+                    # label; keep one only on that same majority overlap.
+                    fresh = have_label and label_still_applies(
+                        cid,
+                        communities[cid],
+                        previous_node_community,
+                        None,
+                        None,
+                    )
                 else:
-                    # No signature sidecar (labels predate it). A differing community
-                    # COUNT means the labels describe a different clustering, so a cid's
-                    # old label can't be trusted; equal count is the best "same" signal.
-                    fresh = have_label and not count_mismatch
+                    # No signature sidecar and an equal community count: that
+                    # count is still the best available "unchanged" signal.
+                    fresh = have_label
                 if fresh:
                     labels[cid] = existing_labels[cid]
                 else:
@@ -3948,6 +3987,7 @@ def dispatch_command(cmd: str) -> None:
                 existing_graph_path,
                 target,
                 detection.get("unchanged_files", {}).get("code", []),
+                manifest_path,
             )
             if _healed_sources:
                 print(
@@ -4096,15 +4136,40 @@ def dispatch_command(cmd: str) -> None:
         # an API key; the key is enforced below only when there's LLM work.
         from graphify.llm import (
             BACKENDS as _BACKENDS,
-            detect_backend as _detect_backend,
+            detect_backend_with_source as _detect_backend_with_source,
+            backend_disabled_by_env as _backend_disabled_by_env,
             estimate_cost as _estimate_cost,
             extract_corpus_parallel as _extract_corpus_parallel,
             _format_backend_env_keys,
             _get_backend_api_key,
         )
         needs_llm = bool(semantic_files) or dedup_llm
-        if backend is None and needs_llm:
-            backend = _detect_backend()
+        backend_source = None
+        if backend is None and needs_llm and _backend_disabled_by_env():
+            # GRAPHIFY_BACKEND=none: keep the local AST pass and skip every LLM
+            # step, rather than failing or quietly auto-selecting a cloud provider
+            # (#4361). Mirrors --code-only's report of what was held back.
+            skipped = len(semantic_files)
+            print(
+                f"[graphify extract] GRAPHIFY_BACKEND=none: skipping LLM work "
+                f"({skipped} non-code file(s) and LLM dedup kept out); indexing code only."
+            )
+            semantic_files = []
+            doc_files = []
+            paper_files = []
+            image_files = []
+            dedup_llm = False
+            needs_llm = False
+        elif backend is None and needs_llm:
+            backend, backend_source = _detect_backend_with_source()
+            if backend and backend_source.startswith("auto-detected"):
+                # Name the exact setting that chose the backend, so sending the
+                # corpus to a cloud provider is never a surprise (#4361).
+                print(
+                    f"[graphify] using backend '{backend}' ({backend_source}); pass "
+                    "--backend or set GRAPHIFY_BACKEND to choose explicitly, or "
+                    "GRAPHIFY_BACKEND=none to disable LLM work."
+                )
         if backend is not None and backend not in _BACKENDS:
             print(
                 f"error: unknown backend '{backend}'. "
@@ -4277,6 +4342,8 @@ def dispatch_command(cmd: str) -> None:
                             "_callable", "_callable_class", "_elixir_module",
                             "_rust_impl_key", "_rust_declaration_count",
                             "_ts_public_twin", "_py_property", "_java_ret",
+                            "_ts_fields", "_ts_static_fields",
+                            "_py_fixture",
                         ):
                             if _node.get(_marker):
                                 _ctx_node[_marker] = _node[_marker]
@@ -4306,11 +4373,13 @@ def dispatch_command(cmd: str) -> None:
                             if _fwd_metadata:
                                 _ctx_node["metadata"] = _fwd_metadata
                         _ctx_nodes.append(_ctx_node)
+                    # Import edges come too: a TS field inherited from an unchanged file
+                    # is typed by that file's imports, as in a full build.
                     for _edge in _ctx_graph.get(
                         "links", _ctx_graph.get("edges", [])
                     ):
                         if _edge.get("relation") not in (
-                            "contains", "method", "inherits"
+                            "contains", "method", "inherits", "imports", "imports_from"
                         ):
                             continue
                         if not _ctx_is_ast_tier(_edge):
@@ -4418,7 +4487,8 @@ def dispatch_command(cmd: str) -> None:
                 print(f"[graphify extract] semantic cache: {sem_cache_hits} hit / {sem_cache_misses} miss")
 
             if uncached_paths:
-                print(f"[graphify extract] semantic extraction on {len(uncached_paths)} files via {backend}...")
+                _via = f"{backend}" + (f", {backend_source}" if backend_source else "")
+                print(f"[graphify extract] semantic extraction on {len(uncached_paths)} files via {_via}...")
                 corpus_kwargs: dict = {
                     "backend": backend,
                     "model": model,
@@ -4670,6 +4740,10 @@ def dispatch_command(cmd: str) -> None:
         # #2543: also drop AST sources that failed (missing optional extra /
         # zero-node anomaly) so they are not frozen as up-to-date.
         _failed_ast_sources = list(ast_result.get("failed_sources") or [])
+        # #2879: code files the extractor declined by design this run. They ARE
+        # stamped (not failures) but have zero nodes, so the manifest marks the
+        # emptiness intentional and the #2543 heal stops re-queuing them.
+        _ast_empty_sources = list(ast_result.get("skipped_sources") or [])
         _manifest_files = _stamped_manifest_files(
             files_by_type,
             sem_result,
@@ -4757,7 +4831,7 @@ def dispatch_command(cmd: str) -> None:
                     "(--no-cluster); outputs left untouched."
                 )
                 try:
-                    _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus, clear_semantic=_cleared_semantic, clear_ast=_cleared_ast or None)
+                    _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus, clear_semantic=_cleared_semantic, clear_ast=_cleared_ast or None, ast_empty=_ast_empty_sources or None)
                 except Exception as exc:
                     print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
                 stages.total()
@@ -4892,7 +4966,7 @@ def dispatch_command(cmd: str) -> None:
                 )
             try:
                 if has_path:
-                    _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus, clear_semantic=_cleared_semantic, clear_ast=_cleared_ast or None)
+                    _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus, clear_semantic=_cleared_semantic, clear_ast=_cleared_ast or None, ast_empty=_ast_empty_sources or None)
             except Exception as exc:
                 print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
             if global_merge:
@@ -5104,7 +5178,7 @@ def dispatch_command(cmd: str) -> None:
         _wja(analysis_path, analysis, indent=2)
         try:
             if has_path:
-                _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus, clear_semantic=_cleared_semantic, clear_ast=_cleared_ast or None)
+                _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both", root=target, scan_corpus=_scan_corpus, clear_semantic=_cleared_semantic, clear_ast=_cleared_ast or None, ast_empty=_ast_empty_sources or None)
         except Exception as exc:
             print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
 
