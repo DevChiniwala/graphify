@@ -493,6 +493,65 @@ def test_rebuild_code_drops_labels_whose_community_changed(tmp_path):
             )
 
 
+def test_rebuild_keeps_label_on_majority_overlap(tmp_path, monkeypatch):
+    """#2298: an update that adds one node to a community keeps the saved name
+    when the previous members are still a strict majority of the new set."""
+    import json
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    source = (
+        "def alpha():\n    return beta()\n\n"
+        "def beta():\n    return gamma()\n\n"
+        "def gamma():\n    return 1\n"
+    )
+    (corpus / "a.py").write_text(source, encoding="utf-8")
+    assert _rebuild_code(corpus, acquire_lock=False) is True
+
+    out = corpus / "graphify-out"
+    labels_file = out / ".graphify_labels.json"
+    graph = json.loads((out / "graph.json").read_text(encoding="utf-8"))
+    communities: dict[int, list[str]] = {}
+    previous: dict[str, int] = {}
+    for node in graph["nodes"]:
+        cid = node.get("community")
+        node_id = node.get("id")
+        if cid is None or node_id is None:
+            continue
+        communities.setdefault(int(cid), []).append(str(node_id))
+        previous[str(node_id)] = int(cid)
+    assert communities, "expected the first rebuild to cluster at least one community"
+    largest = max(communities, key=lambda cid: (len(communities[cid]), -cid))
+    assert len(communities[largest]) >= 2, (
+        f"largest community {largest} has {communities[largest]}; need at least 2 nodes"
+    )
+
+    distinctive = "Kept Majority Name"
+    labels_file.write_text(json.dumps({str(largest): distinctive}), encoding="utf-8")
+
+    (corpus / "a.py").write_text(
+        source + "\ndef delta():\n    return alpha()\n",
+        encoding="utf-8",
+    )
+
+    def _cluster_extend_largest(G, *args, **kwargs):
+        grouped: dict[int, list[str]] = {}
+        for node in G.nodes:
+            nid = str(node)
+            cid = previous.get(nid, largest)
+            grouped.setdefault(cid, []).append(nid)
+        return grouped
+
+    import graphify.cluster  # bind the submodule; the package attribute is lazy
+
+    monkeypatch.setattr(graphify.cluster, "cluster", _cluster_extend_largest)
+    assert _rebuild_code(corpus, acquire_lock=False) is True
+
+    saved = json.loads(labels_file.read_text(encoding="utf-8"))
+    assert distinctive in saved.values()
+
+
 def test_rebuild_code_keeps_hub_fallback_labels_out_of_the_tracked_file(tmp_path):
     """#3334: a from-empty rebuild (a fresh clone, a new worktree, any CI job
     with no prior graphify-out/) names every community by its deterministic
@@ -3142,6 +3201,77 @@ def test_rebuild_code_quick_scans_doc_without_semantic_nodes(tmp_path):
     assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
     ids = {n["id"] for n in json.loads(graph_path.read_text(encoding="utf-8"))["nodes"]}
     assert {"notes", "notes_alpha", "notes_beta"} <= ids
+
+
+def test_rebuild_code_quick_scans_markdown_classified_as_paper(tmp_path):
+    """#4750: a .md that detect() classifies as a paper (arXiv id, "arxiv",
+    an Abstract heading) is still Markdown. The AST-only rebuild must
+    quick-scan it like any other doc instead of giving it zero nodes, while a
+    PDF paper (no AST extractor) stays out of the rebuild."""
+    from graphify.detect import detect
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    (corpus / "paper_notes.md").write_text(
+        "# Notes on a paper\n\narXiv 2501.00001\n\n## Abstract\n\nWe study X.\n",
+        encoding="utf-8",
+    )
+    (corpus / "plain_notes.md").write_text("# Plain notes\n\n## Section\n\nSome text.\n", encoding="utf-8")
+    (corpus / "scan.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+    files = detect(corpus)["files"]
+    assert any(Path(p).name == "paper_notes.md" for p in files["paper"]), "precondition: .md classified as paper"
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    nodes = json.loads((corpus / "graphify-out" / "graph.json").read_text(encoding="utf-8"))["nodes"]
+    by_source = {Path(n.get("source_file") or "").name for n in nodes}
+    assert "paper_notes.md" in by_source, "paper-classified Markdown got zero nodes (#4750)"
+    assert "plain_notes.md" in by_source
+    assert "scan.pdf" not in by_source
+
+
+@pytest.mark.parametrize("incremental", [False, True])
+def test_rebuild_code_does_not_quick_scan_semantic_backed_paper_markdown(tmp_path, incremental):
+    """#4750 x #1915: a paper-classified .md that already carries a semantic
+    (LLM) layer must not get an AST heading layer on top once papers enter the
+    quick-scan. Its semantic nodes stay the sole representation, on a full and
+    on an incremental rebuild."""
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+
+    paper = corpus / "paper_notes.md"
+    paper.write_text(
+        "# Notes on a paper\n\narXiv 2501.00001\n\n## Abstract\n\nWe study X.\n",
+        encoding="utf-8",
+    )
+    graph_path = corpus / "graphify-out" / "graph.json"
+    data = json.loads(graph_path.read_text(encoding="utf-8"))
+    semantic_ids = {"paper_notes_paper", "paper_notes_method"}
+    data["nodes"].extend([
+        {"id": "paper_notes_paper", "label": "Notes on a paper", "file_type": "paper",
+         "source_file": "paper_notes.md"},
+        {"id": "paper_notes_method", "label": "Method", "file_type": "concept",
+         "source_file": "paper_notes.md"},
+    ])
+    data["links"].append(
+        {"source": "paper_notes_paper", "target": "paper_notes_method", "relation": "describes",
+         "confidence": "INFERRED", "source_file": "paper_notes.md"},
+    )
+    graph_path.write_text(json.dumps(data), encoding="utf-8")
+    before = len(data["nodes"])
+
+    kwargs = {"changed_paths": [paper]} if incremental else {}
+    _rebuild_code(corpus, no_cluster=True, acquire_lock=False, **kwargs)
+
+    after = json.loads(graph_path.read_text(encoding="utf-8"))["nodes"]
+    paper_ids = {n["id"] for n in after if Path(n.get("source_file") or "").name == "paper_notes.md"}
+    assert paper_ids == semantic_ids, f"AST layer added on a semantic-backed paper: {paper_ids - semantic_ids}"
+    assert len(after) == before
 
 
 def test_full_rebuild_preserves_semantic_backed_doc_ast_layer(tmp_path):
