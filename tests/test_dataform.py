@@ -190,3 +190,30 @@ def test_multiline_ref_call_is_extracted(tmp_path):
         "dataform_upstream"
     ]
     assert result["edges"][0]["source_location"] == "L2"
+
+
+def test_ref_with_nonliteral_arguments_does_not_fabricate_a_dependency(tmp_path):
+    model = tmp_path / "dynamic_ref.sqlx"
+    for arguments in (
+        '"analytics", model_name',
+        'schema_name, "upstream"',
+        '"upstream" + suffix',
+        '"analytics", "upstream", variable',
+        '"", "upstream"',
+        '"analytics", ""',
+    ):
+        model.write_text(f"SELECT * FROM ${{ref({arguments})}};\n", encoding="utf-8")
+
+        assert extract_dataform(model)["edges"] == [], arguments
+
+
+def test_literal_ref_arguments_allow_comments_and_trailing_comma(tmp_path):
+    model = tmp_path / "literal_ref.sqlx"
+    model.write_text(
+        'SELECT * FROM ${ref("analytics", /* schema */ "upstream",)};\n',
+        encoding="utf-8",
+    )
+
+    assert [edge["target"] for edge in extract_dataform(model)["edges"]] == [
+        "dataform_upstream"
+    ]

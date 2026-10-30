@@ -252,8 +252,19 @@ def _mask_comments(text: str) -> str:
 
 
 def _call_target(kind: str, args: str, model_name: str) -> str | None:
+    # A string occurring inside an expression is not a literal ref argument.
+    # Check separators as well, rather than guessing from only quoted spans.
+    matches = list(_STRING_RE.finditer(args))
+    offset = 0
+    for index, match in enumerate(matches):
+        if args[offset : match.start()].strip() != ("," if index else ""):
+            return None
+        offset = match.end()
+    trailing = args[offset:].strip()
+    if trailing and (not matches or trailing != ","):
+        return None
     values = [
-        value for match in _STRING_RE.finditer(args) if (value := _literal_string(match.group(0)))
+        value for match in matches if (value := _literal_string(match.group(0))) is not None
     ]
     if kind.casefold() == "self":
         return model_name if not values else ".".join(values[:2])
