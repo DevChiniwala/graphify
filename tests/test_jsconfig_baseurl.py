@@ -254,6 +254,40 @@ def test_tsconfig_child_baseurl_overrides_parent_relative_to_child(tmp_path):
     assert _cid(tmp_path, parent_target) not in targets
 
 
+def test_tsconfig_later_parent_reapplies_shared_ancestor_baseurl(tmp_path):
+    """A shared ancestor is not a cycle across separate extends branches (#2200)."""
+    _write(
+        tmp_path / "shared.json",
+        json.dumps({"compilerOptions": {"baseUrl": "./shared-src"}}),
+    )
+    _write(
+        tmp_path / "left.json",
+        json.dumps({
+            "extends": "./shared.json",
+            "compilerOptions": {"baseUrl": "./left-src"},
+        }),
+    )
+    _write(tmp_path / "right.json", json.dumps({"extends": "./shared.json"}))
+    _write(
+        tmp_path / "tsconfig.json",
+        json.dumps({"extends": ["./left.json", "./right.json"]}),
+    )
+    shared_target = _write(
+        tmp_path / "shared-src" / "mods" / "Widget.js", "export default 1;\n"
+    )
+    left_target = _write(
+        tmp_path / "left-src" / "mods" / "Widget.js", "export default 2;\n"
+    )
+    importer = _write(
+        tmp_path / "main.js", "import Widget from 'mods/Widget.js';\n"
+    )
+
+    targets = _targets(extract([importer], root=tmp_path))
+
+    assert _cid(tmp_path, shared_target) in targets
+    assert _cid(tmp_path, left_target) not in targets
+
+
 def test_tsconfig_jsonc_parent_and_null_child_options_are_safe(tmp_path):
     """JSONC parents and ``compilerOptions: null`` must not abort resolution (#2200)."""
     _write(

@@ -315,6 +315,7 @@ def _read_tsconfig_base_url(
     configs are processed in declaration order, so a later parent wins; the
     child config wins over every parent. Missing or non-local parents are
     ignored, matching the alias resolver's existing extends behavior.
+    Cycle detection is scoped to each branch so shared parents are reapplied.
     """
     key = str(tsconfig)
     if key in seen:
@@ -336,7 +337,7 @@ def _read_tsconfig_base_url(
         extended_path = _resolve_tsconfig_extends(base_dir, ext)
         if extended_path is not None:
             parent_base_url = _read_tsconfig_base_url(
-                extended_path, extended_path.parent, seen
+                extended_path, extended_path.parent, seen.copy()
             )
             if parent_base_url is not None:
                 inherited = parent_base_url
